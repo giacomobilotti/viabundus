@@ -25,5 +25,5 @@ edges <- read.csv(file = file.path(sourcedir, 'Edges.csv'), fileEncoding = "UTF-
 nodes <- st_as_sf(nodes, coords = c('Longitude', 'Latitude'), 
                   crs = 4326) |>
   st_transform(3035)
-
-st_write(nodes, dsn = file.path(targetdir, 'nodes.gpkg'))
+# Uncomment it to save it as gpkg
+# st_write(nodes, dsn = file.path(targetdir, 'nodes.gpkg'))

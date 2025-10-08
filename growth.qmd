@@ -1,0 +1,261 @@
+---
+title: "growth"
+format: html
+---
+
+```{r}
+#| label: loading-data
+#| output: false
+
+# load libraries
+library(ggplot2)
+library(RColorBrewer)
+library(GGally)
+library(tmap)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggalluvial)
+library(sf)
+
+# set up directories
+climdir <- file.path('data', 'raw_data', 'NOAA')
+sourcedir <- file.path('data', 'raw_data')
+targetdir <- file.path('data', 'derived_data')
+
+# load cities
+nodes <- st_read(file.path(targetdir, 'nodes.gpkg'))
+nodes$Town_First_Mentioned <- as.numeric(nodes$Town_First_Mentioned)
+nodes$Settlement_From <- as.numeric(nodes$Settlement_From)
+
+# load demographic data
+population <- read.csv(file = file.path(sourcedir, 'Viabundus-1.3-CSV',  'Population.csv'))
+# Load modern countries for background maps
+w <- rnaturalearthhires::map_units10[rnaturalearthhires::map_units10$REGION_UN == 'Europe',] |>
+  st_transform(3035) |>
+  st_crop(st_buffer(nodes, 1.5e+05))
+# combine population and urban data
+spatial_pop <- merge(population,  nodes, by.x = 'Nodes_ID', by.y = 'ID', all.x = TRUE)
+# reset it as spatial
+spatial_pop <- st_as_sf(spatial_pop)
+# Load linguistic areas
+areas <- st_read(dsn  = file.path('data', 'derived_data', 'linguistic_areas.gpkg') ) |>
+  st_transform(st_crs(spatial_pop))
+
+```
+
+## HYDE data
+
+The folder is organised in a way that there are base, upper and lower estimates. Then, rasters are divided by year.
+
+The innermost folder with the year estimate contains:
+
+popc_<yr>.asc (population counts, in inhabitants/gridcell)
+popd_<yr>.asc (population density, in inhabitants/km2 per gridcell)
+rurc_<yr>.asc (rural population counts, in inh/gridcell)
+urb_<yr>.asc  (urban population counts, in inh/gridcell)
+uopp_<yr>.asc (total built-up area, such as towns, cities, etc, in km2 per grid cell)
+
+
+```{r}
+#| label: load-hyde
+
+
+library(terra)
+
+# get scenarios (base, low, high)
+scenarios <- list.dirs(hydedir, recursive = FALSE)
+
+hyde <- lapply(
+  X = scenarios, 
+  FUN = function(scen) {
+    tmp <- list.files(scen, pattern = "pop\\.zip$", full.names = TRUE)
+    
+    tmp_yr <- lapply(
+      X = tmp,
+      FUN = function(yr) {
+        
+        files_in_zip <- unzip(yr, list = TRUE)$Name
+        # print(files_in_zip)
+        
+        temp <- tempdir()
+        tmp_asc <- unzip(zipfile = yr, exdir = temp)
+        
+        # print(tmp_asc)      
+        tmp_est <- lapply(
+          X = seq_along(files_in_zip),
+          FUN = function(i) {
+            rast(tmp_asc[i]) |>
+              crop(v_areas) |>
+              mask(v_areas)
+          }
+        )
+        names(tmp_est) <- unlist(strsplit(files_in_zip, "_"))[seq(1, length(files_in_zip)*2, by = 2)]
+        return(tmp_est)
+      }
+    )
+    names(tmp_yr) <- unlist(strsplit(list.files(scen, pattern = "pop\\.zip$"), "_"))[seq(1, length(tmp_yr)*2, by = 2)]
+    return(tmp_yr)
+    # print(tmp)
+  }
+)
+names(hyde) <- c('base', 'upper', 'low')
+
+pop_stats <- lapply(
+  X = hyde,
+  FUN = function(estim) {
+    
+    do.call(rbind, lapply(names(estim), function(yr) {
+    
+      rasters <- estim[[yr]]
+      
+      total_pop  <- sum(values(rasters$popc), na.rm = TRUE)
+      rural_pop  <- sum(values(rasters$rurc), na.rm = TRUE)
+      urban_pop  <- sum(values(rasters$urb),  na.rm = TRUE)
+      
+      tmp_df <- data.frame(
+        year = as.integer(gsub("AD", "", yr)),
+        total = total_pop,
+        rural = rural_pop,
+        urban = urban_pop
+      )
+      return(tmp_df)
+    }))
+  
+  }
+)
+
+# combine scenarios
+df_base  <- pop_stats$base  %>% mutate(scenario = "base")
+df_upper <- pop_stats$upper %>% mutate(scenario = "upper")
+df_low   <- pop_stats$low   %>% mutate(scenario = "low")
+
+df_all <- bind_rows(df_base, df_upper, df_low)
+
+# reshape to long format
+df_long <- df_all %>%
+  pivot_longer(cols = c(total, rural, urban),
+               names_to = "type", values_to = "population")
+
+# plot
+ggplot(df_long, aes(x = year, y = population, color = type, linetype = scenario)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = c(total = "black", rural = "forestgreen", urban = "firebrick")) +
+  scale_linetype_manual(values = c(base = "solid", upper = "dashed", low = "dotted")) +
+  labs(
+    x = "Year AD",
+    y = "Population (inhabitants)",
+    color = "Population type",
+    linetype = "Scenario",
+    title = "HYDE Population Over Time (Base, Upper, Low)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+### Population by region 
+
+Same plot but divided by the 4 regions
+
+```{r}
+#| label: reg-hyde
+
+reg_hyde <- lapply(areas$region, function(region) {
+  lapply(hyde, function(estim) {
+    lapply(estim, function(period) {
+      # period is a list of SpatRaster
+      lapply(period, function(r) {
+        crop(r, v_areas[v_areas$region == region]) |>
+          mask(v_areas[v_areas$region == region])
+      })
+    })
+  })
+})
+names(reg_hyde) <- areas$region
+
+reg_pop_stats <- lapply(reg_hyde, function(region_list) {
+  
+  # region_list: list of scenarios for one region
+  lapply(region_list, function(scenario_list) {
+    
+    # scenario_list: list of years
+    do.call(rbind, lapply(names(scenario_list), function(yr) {
+      rasters <- scenario_list[[yr]]
+      
+      # compute totals
+      total_pop <- sum(values(rasters$popc), na.rm = TRUE)
+      rural_pop <- sum(values(rasters$rurc), na.rm = TRUE)
+      urban_pop <- sum(values(rasters$urb), na.rm = TRUE)
+      
+      data.frame(
+        year = as.integer(gsub("AD", "", yr)),
+        total = total_pop,
+        rural = rural_pop,
+        urban = urban_pop,
+        stringsAsFactors = FALSE
+      )
+    }))
+    
+  })
+})
+
+
+# Flatten reg_pop_stats (base, low, upper) into one data.frame with region column
+df_regions <- bind_rows(
+  lapply(names(reg_pop_stats), function(region_name) {
+    region_list <- reg_pop_stats[[region_name]]
+    # assume region_list contains all 3 scenarios: base, low, upper
+    bind_rows(
+      lapply(names(region_list), function(scenario_name) {
+        df <- region_list[[scenario_name]]  # data.frame for that scenario
+        df$region   <- region_name
+        df$scenario <- scenario_name
+        df
+      })
+    )
+  })
+)
+
+
+# Pivot to long format for ggplot
+df_long <- df_regions %>%
+  pivot_longer(cols = c(total, rural, urban),
+               names_to = "type",
+               values_to = "population")
+
+# If you have 'low' and 'upper' scenarios, compute ribbon bounds
+df_ribbon <- df_long %>%
+  group_by(region, year, type) %>%
+  summarize(
+    lower = population[scenario == "low"],
+    upper = population[scenario == "upper"],
+    .groups = "drop"
+  )
+
+# Merge ribbon info into base scenario for plotting lines
+df_plot <- df_long %>%
+  filter(scenario == "base") %>%
+  left_join(df_ribbon, by = c("region", "year", "type"))
+
+# Define colors
+line_colors <- c(total = "black", rural = "forestgreen", urban = "firebrick")
+
+# Plot
+ggplot(df_plot, aes(x = year, y = population, color = type, fill = type)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = line_colors) +
+  scale_fill_manual(values = line_colors) +
+  facet_wrap(~region, scales = "free_y") +
+  labs(
+    x = "Year AD",
+    y = "Population (inhabitants)",
+    color = "Population type",
+    fill = "Population type",
+    title = "Population Over Time by Region with Uncertainty"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+
